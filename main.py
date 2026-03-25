@@ -1,6 +1,7 @@
 import collections
 import collections.abc
 
+# Monkey-patch for DroneKit compatibility with newer Python versions
 collections.MutableMapping = collections.abc.MutableMapping
 
 from dronekit import connect, VehicleMode
@@ -14,21 +15,11 @@ def get_distance_metres(lat1, lon1, lat2, lon2):
     dlong = lon2 - lon1
     return math.sqrt((dlat*dlat) + (dlong*dlong)) * 1.113195e5
 
-def get_bearing(lat1, lon1, lat2, lon2):
-    off_x = lon2 - lon1
-    off_y = lat2 - lat1
-    bearing = 90.00 + math.atan2(-off_y, off_x) * 57.2957795
-    if bearing < 0:
-        bearing += 360.00
-    return bearing
-
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
-
 def angle_error_deg(target, current):
     return (target - current + 180.0) % 360.0 - 180.0
-
 
 def get_ne_error_m(lat1, lon1, lat2, lon2):
     r = 6378137.0
@@ -39,7 +30,6 @@ def get_ne_error_m(lat1, lon1, lat2, lon2):
     north = dlat * r
     east = dlon * r * math.cos(lat_avg)
     return north, east
-
 
 def rotate_ne_to_body(north, east, heading_deg):
     yaw = math.radians(heading_deg)
@@ -65,22 +55,17 @@ def active_flight_and_land(vehicle, target_lat, target_lon, target_alt):
 
     print("Motors armed! Engaging dynamic control loop...")
 
-    # Tune this first: actual PWM that roughly holds hover in STABILIZE
     hover_throttle = 1500
 
-    # XY controller
     kp_xy = 70.0
     kd_xy = 45.0
 
-    # Altitude controller
     kp_alt = 80.0
     kd_alt = 40.0
 
-    # Yaw hold controller
     kp_yaw = 4.0
     landing_heading = vehicle.heading
 
-    # Precision landing logic
     descend_radius_m = 0.6
     center_hold_s = 1.0
     deadband_m = 0.20
@@ -100,7 +85,7 @@ def active_flight_and_land(vehicle, target_lat, target_lon, target_alt):
 
         loc = vehicle.location.global_relative_frame
         heading = vehicle.heading
-        vn, ve, vd = vehicle.velocity  # m/s: north, east, down
+        vn, ve, vd = vehicle.velocity
 
         north_err, east_err = get_ne_error_m(
             loc.lat,
@@ -109,18 +94,15 @@ def active_flight_and_land(vehicle, target_lat, target_lon, target_alt):
             target_lon,
         )
 
-        # Low-pass filter GPS position error
         filt_north = alpha * north_err + (1.0 - alpha) * filt_north
         filt_east = alpha * east_err + (1.0 - alpha) * filt_east
 
         horiz_dist = math.hypot(filt_north, filt_east)
         horiz_speed = math.hypot(vn, ve)
 
-        # Convert position and velocity to body frame
         fwd_err, right_err = rotate_ne_to_body(filt_north, filt_east, heading)
         fwd_vel, right_vel = rotate_ne_to_body(vn, ve, heading)
 
-        # Deadband near center so it does not chase GPS jitter
         if abs(fwd_err) < deadband_m:
             fwd_err = 0.0
         if abs(right_err) < deadband_m:
@@ -130,7 +112,6 @@ def active_flight_and_land(vehicle, target_lat, target_lon, target_alt):
         fwd_effort = kp_xy * fwd_err - kd_xy * fwd_vel
         right_effort = kp_xy * right_err - kd_xy * right_vel
 
-        # Reduce tilt authority close to ground
         max_xy = 180 if loc.alt > 3.0 else 90
         fwd_effort = clamp(fwd_effort, -max_xy, max_xy)
         right_effort = clamp(right_effort, -max_xy, max_xy)
@@ -139,14 +120,13 @@ def active_flight_and_land(vehicle, target_lat, target_lon, target_alt):
         pitch = int(clamp(1500 - fwd_effort, 1300, 1700))
         roll = int(clamp(1500 + right_effort, 1300, 1700))
 
-        # Hold heading fixed instead of always yawing toward target
         yaw_err = angle_error_deg(landing_heading, heading)
         if abs(yaw_err) < 2.0:
             yaw = 1500
         else:
             yaw = int(clamp(1500 + kp_yaw * yaw_err, 1400, 1600))
 
-        # Descend only when centered and slow
+ # 1. Check if we are hovering stably over the target
         if horiz_dist < descend_radius_m and horiz_speed < 0.20:
             if centered_since is None:
                 centered_since = now
@@ -154,29 +134,51 @@ def active_flight_and_land(vehicle, target_lat, target_lon, target_alt):
             centered_since = None
 
         if centered_since is not None and (now - centered_since) > center_hold_s:
+            # Gradually push the target altitude into the ground
             if loc.alt > 3.0:
-                target_alt -= 0.30 * dt
+                target_alt -= 0.30 * dt   # Fast descent
             elif loc.alt > 1.0:
-                target_alt -= 0.15 * dt
+                target_alt -= 0.15 * dt   # Slow down near the ground
             else:
-                target_alt -= 0.08 * dt
+                target_alt -= 0.08 * dt   # Very slow final approach
 
+        # Don't let the target altitude go below zero
         target_alt = max(0.0, target_alt)
 
-        # Altitude PD controller
+        # 3. Altitude PID Controller (Always running)
         alt_err = target_alt - loc.alt
-        climb_rate = -vd  # positive = climbing
+        climb_rate = -vd 
         throttle_effort = kp_alt * alt_err - kd_alt * climb_rate
-        throttle = int(
-            clamp(hover_throttle + throttle_effort, 1300, 1700)
-        )
+        throttle = int(clamp(hover_throttle + throttle_effort, 1300, 1700))
 
+        # 4. Send the RC Overrides
         vehicle.channels.overrides = {
             "1": roll,
             "2": pitch,
             "3": throttle,
             "4": yaw,
         }
+
+        # 5. Touchdown Detection & Motor Kill
+        if loc.alt <= 0.5 and target_alt <= 0.2 and horiz_speed < 0.15:
+            print("--- TOUCHDOWN! Cutting throttle and disarming. ---")
+            
+            # Immediately drop throttle RC to 1000 to kill motor lift in STABILIZE
+            vehicle.channels.overrides = {
+                "1": 1500,
+                "2": 1500,
+                "3": 1000, 
+                "4": 1500,
+            }
+            time.sleep(1) # Wait a second for motors to spool down
+            
+            # Disarm the vehicle
+            vehicle.armed = False
+            
+            current_loc = vehicle.location.global_relative_frame
+            print(f"Final coordinates: {current_loc.lat}, {current_loc.lon}")
+            print(f"Distance from target: {get_distance_metres(current_loc.lat, current_loc.lon, target_lat, target_lon):.2f}m")
+            break # Exit the loop successfully
 
         print(
             f"D={horiz_dist:.2f}m "
@@ -185,20 +187,6 @@ def active_flight_and_land(vehicle, target_lat, target_lon, target_alt):
             f"Alt={loc.alt:.2f}/{target_alt:.2f} "
             f"V={horiz_speed:.2f}"
         )
-
-        if loc.alt <= 0.5 and target_alt <= 0.2 and horiz_speed < 0.15:
-            print("--- TOUCHDOWN! Cutting throttle and disarming. ---")
-            current_loc = vehicle.location.global_relative_frame
-            print(f"Final coordinates - {current_loc.lat} {current_loc.lon}, with difference of {get_distance_metres(current_loc.lat, current_loc.lon, target_lat, target_lon):.1}m")
-            vehicle.channels.overrides = {
-                "1": 1500,
-                "2": 1500,
-                "3": 1000,
-                "4": 1500,
-            }
-            time.sleep(1)
-            vehicle.armed = False
-            break
 
         time.sleep(0.05)
 
